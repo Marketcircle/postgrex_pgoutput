@@ -17,12 +17,157 @@ defmodule Postgrex.PgOutput.Type do
 
   pg_types = for type <- types, do: struct(Postgrex.TypeInfo, type)
 
-  for type = %{oid: oid, type: type_name} <- pg_types do
-    def type_info(unquote(type_name)), do: unquote(Macro.escape(type))
-    def oid_to_info(unquote(oid)), do: unquote(Macro.escape(type))
+  # ETS table name for runtime types
+  @runtime_types_table :postgrex_pgoutput_runtime_types
+
+  # Store compile time types for reference
+  @compiled_time_types pg_types
+  def compiled_time_types, do: @compiled_time_types
+
+  @spec has_runtime_types?() :: boolean()
+  @doc """
+  Returns if any runtime types have been loaded
+  """
+  def has_runtime_types? do
+    ets_table_exists?() and :ets.info(@runtime_types_table, :size) > 0
   end
 
-  def all_types, do: unquote(Macro.escape(pg_types))
+  for type = %{oid: oid, type: type_name} <- pg_types do
+    def type_info_compiled(unquote(type_name)), do: unquote(Macro.escape(type))
+    def oid_to_info_compiled(unquote(oid)), do: unquote(Macro.escape(type))
+  end
+
+  # Fallback functions for compile-time lookups
+  def type_info_compiled(_type_name), do: nil
+  def oid_to_info_compiled(_oid), do: nil
+
+  def type_info(type_name) do
+    # First check compile-time types
+    case type_info_compiled(type_name) do
+      nil ->
+        # Fall back to runtime types if the table exists
+        if ets_table_exists?() do
+          case :ets.lookup(@runtime_types_table, {:type, type_name}) do
+            [{_, type_info}] -> type_info
+            [] -> nil
+          end
+        else
+          nil
+        end
+
+      type_info ->
+        type_info
+    end
+  end
+
+  def oid_to_info(oid) do
+    # First check compile-time types
+    case oid_to_info_compiled(oid) do
+      nil ->
+        # Fall back to runtime types if the table exists
+        if ets_table_exists?() do
+          case :ets.lookup(@runtime_types_table, {:oid, oid}) do
+            [{_, type_info}] -> type_info
+            [] -> nil
+          end
+        else
+          nil
+        end
+
+      type_info ->
+        type_info
+    end
+  end
+
+  # Helper to safely check if the ETS table exists
+  defp ets_table_exists? do
+    :ets.whereis(@runtime_types_table) != :undefined
+  end
+
+  @doc """
+  Returns all types, compiled and runtime loaded types
+  """
+  def all_types do
+    compiled_time_types = @compiled_time_types
+
+    # Get all runtime types if table exists
+    runtime_types =
+      if ets_table_exists?() do
+        :ets.select(@runtime_types_table, [{{{:type, :_}, :"$1"}, [], [:"$1"]}])
+      else
+        []
+      end
+
+    # Return the combined list of unique types
+    compiled_time_types ++ runtime_types
+  end
+
+  @doc """
+  Loads PostgreSQL type information from a types file at runtime.
+  """
+  def load_runtime_types(types_file) do
+    # Ensure the ETS table exists
+    ensure_ets_table()
+
+    with {:ok, bin} <- File.read(types_file),
+         {types, _} <- Code.eval_string(bin) do
+      # Ensure types are valid before processing
+      case validate_types(types) do
+        {:ok, valid_types} ->
+          # Convert to TypeInfo structs
+          type_infos = Enum.map(valid_types, &struct(Postgrex.TypeInfo, &1))
+
+          # Store in ETS table
+          for type_info = %{oid: oid, type: type_name} <- type_infos do
+            :ets.insert(@runtime_types_table, {{:type, type_name}, type_info})
+            :ets.insert(@runtime_types_table, {{:oid, oid}, type_info})
+          end
+
+          {:ok, length(type_infos)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:error, reason} -> {:error, {:file_read_error, reason}}
+      error -> {:error, {:unexpected_error, error}}
+    end
+  end
+
+  # Ensure the ETS table exists
+  defp ensure_ets_table do
+    if :ets.whereis(@runtime_types_table) == :undefined do
+      :ets.new(@runtime_types_table, [:named_table, :set, :public])
+    end
+  end
+
+  # Validate the structure of loaded types
+  defp validate_types(types) when is_list(types) do
+    invalid_types =
+      Enum.filter(types, fn type ->
+        not (is_map(type) and Map.has_key?(type, :oid) and Map.has_key?(type, :type))
+      end)
+
+    if invalid_types == [] do
+      {:ok, types}
+    else
+      {:error, {:invalid_types, invalid_types}}
+    end
+  end
+
+  defp validate_types(types), do: {:error, {:invalid_format, types}}
+
+  @doc """
+  Clears the loaded runtime types from the ets table
+  """
+  def clear_runtime_types do
+    if ets_table_exists?() do
+      :ets.delete_all_objects(@runtime_types_table)
+      :ok
+    else
+      {:ok, :no_runtime_types}
+    end
+  end
 
   @json_delim_pattern ~s(\",\")
   @delim_pattern ","
